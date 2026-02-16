@@ -820,9 +820,9 @@ def estimate_job_temperatures(
     """
     
     # Normalize factors
-    # Load-mass penalty: mild correction for very heavy assemblies.
-    # Uses mass (not heat capacity) to avoid double-counting fixture/Cp effects.
-    mass_penalty = 1.0 + (total_mass_kg / 50.0)
+    # Keep neutral to avoid double-counting load effects already modeled
+    # by fixture lag, radiation coupling, and carbon-sheet penalties.
+    mass_penalty = 1.0
     
     # CALCULATE EFFECTIVE RAMP RATE
     # "Digital Twin" correction: The user's furnace and load configuration rarely exceeds 3.5-4.0°C/min linearly.
