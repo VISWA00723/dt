@@ -25,9 +25,39 @@ VACUUM_CONFIG = {
     "pump_down_target": 14,         # mbar (datasheet value)
     "pump_down_hold": 10,           # minutes
     "brazing_partial_pressure": 14, # mbar (datasheet value)
+    "chamber_pressure_mbar": 14,  # canonical field for physics
     "use_n2_backfill": True,
     "backfill_pressure": 1013       # mbar (atmospheric)
 }
+
+VACUUM_CALIBRATION = {
+    "baseline_mbar": 14.0,
+    "lag_constant": 6.0e9,
+}
+
+
+def get_chamber_pressure_mbar(vacuum: Dict[str, Any]) -> float:
+    """Return canonical chamber pressure in mbar from vacuum settings."""
+    if not isinstance(vacuum, dict):
+        return 14.0
+    # Canonical field for physics.
+    if 'chamber_pressure_mbar' in vacuum:
+        return float(vacuum['chamber_pressure_mbar'])
+    # Backward compatibility with older payloads.
+    if 'vacuum_level_mbar' in vacuum:
+        return float(vacuum['vacuum_level_mbar'])
+    if 'brazing_partial_pressure' in vacuum:
+        return float(vacuum['brazing_partial_pressure'])
+    return 14.0
+
+
+def determine_vacuum_mode(vacuum_mbar: float) -> str:
+    """Classify furnace vacuum regime for pressure penalties."""
+    # High-vacuum regime where pressure-sensitive penalties should apply aggressively.
+    if vacuum_mbar <= 0.1:
+        return "high_vacuum"
+    # Partial-pressure regime (e.g., 14 mbar brazing baseline).
+    return "partial_pressure"
 
 # Machine limits for safety clamping
 MACHINE_LIMITS = {
@@ -79,6 +109,8 @@ def compute_job_temperature_lag(materials, geometry, carbon_sheet_thickness_mm=0
     if carbon_sheet_thickness_mm > 0:
         base_lag = conduction_lag + lag_due_to_fixture
         carbon_penalty = base_lag * (carbon_sheet_thickness_mm / 1.0) * 0.35
+        # Cap total carbon penalty to avoid over-penalizing thick sheets.
+        carbon_penalty = min(carbon_penalty, base_lag * 0.50)
         logger.info(f"Carbon sheet lag penalty: +{carbon_penalty:.1f}°C (thickness: {carbon_sheet_thickness_mm}mm)")
 
     return conduction_lag + lag_due_to_fixture + carbon_penalty
@@ -102,6 +134,9 @@ def extract_simulation_context(simulation_state) -> Dict[str, Any]:
     # Update with any vacuum settings from simulation state
     if hasattr(simulation_state, 'vacuum_settings'):
         context["vacuum"].update(simulation_state.vacuum_settings)
+
+    # Normalize canonical pressure field used by physics calculations.
+    context["vacuum"]["chamber_pressure_mbar"] = get_chamber_pressure_mbar(context.get("vacuum", {}))
     
     if hasattr(simulation_state, 'meshes'):
         for part_name, mesh_data in simulation_state.meshes.items():
@@ -215,9 +250,9 @@ def calculate_physics_parameters(simulation_input) -> Dict[str, float]:
             'geometry': geometry,
             'materials': materials,
             'vacuum': getattr(simulation_input, 'vacuum_settings', None) or {
-                'vacuum_level_mbar': 1.4e-2,
+                'chamber_pressure_mbar': 14.0,
                 'leak_rate_mbar_l_s': 1.0e-3,
-                'pump_down_target': 5.0e-4
+                'pump_down_target': 14.0
             }
         }
     elif isinstance(simulation_input, dict):
@@ -299,6 +334,7 @@ def calculate_physics_parameters(simulation_input) -> Dict[str, float]:
             "part": part_name,
             "mass": mass_kg,
             "heat_capacity": heat_capacity,
+            "specific_heat": cp,
             "thermal_diffusivity": thermal_diffusivity,
             "max_dimension": max_dim_mm,
             "volume": volume_m3,
@@ -386,6 +422,8 @@ def calculate_physics_parameters(simulation_input) -> Dict[str, float]:
 
     avg_thermal_diffusivity = sum(p['thermal_diffusivity'] for p in part_details) / len(part_details) if part_details else 1e-5
 
+    chamber_pressure_mbar = get_chamber_pressure_mbar(context.get('vacuum', {}))
+
     return {
         "total_mass": total_mass,
         "total_heat_capacity": total_heat_capacity,
@@ -396,10 +434,12 @@ def calculate_physics_parameters(simulation_input) -> Dict[str, float]:
         "max_dimension": max_dimension,
         "avg_thermal_diffusivity": avg_thermal_diffusivity,
         "h_coeff": effective_h,
+        "effective_emissivity": emissivity,
         "part_details": part_details,
         "vacuum": {
-            "chamber_pressure_mbar": context.get('vacuum', {}).get('vacuum_level_mbar', 1.4e-2)
-        }, # Canonical Vacuum nesting (Problem #2)
+            "chamber_pressure_mbar": chamber_pressure_mbar,
+            "mode": determine_vacuum_mode(chamber_pressure_mbar),
+        }, # Canonical vacuum nesting for physics
         "effective_heat_capacity": total_heat_capacity, # Standardized HC Key (Problem #1)
         "SAF": 1.0,
         "HPR": 1.0,
@@ -416,9 +456,9 @@ def calculate_physics_parameters(simulation_input) -> Dict[str, float]:
 
 def get_physics_ramp_rate(params: Dict[str, float], stage: int, base_solidus: float) -> float:
     """
-    Calculate ramp rate based on thermal time constant and thickness.
-    Uses physics-based formula: Ramp ∝ k / (Lc² * ρ * Cp)
-    Prevents thermal shock and ensures uniform heating throughout the part.
+    Calculate ramp rate using an empirically calibrated, time-constant-driven model.
+    The model uses thermal time constant, thickness, Biot effects, and fixture influence,
+    then applies stage-specific operational bands.
     """
     tau = params['time_constant']
     thickness_mm = params['characteristic_thickness'] * 1000
@@ -467,12 +507,14 @@ def get_physics_ramp_rate(params: Dict[str, float], stage: int, base_solidus: fl
     elif stage == 4: 
         clamped = min(2.0, max(1.0, physics_rate * 0.4))
     elif stage == 5: 
-        return 1.0 # Fixed 1°C/min
+        return min(1.0, MAX_RAMP_RATE_C_PER_MIN) # Fixed 1°C/min + global safety cap
     else:
         clamped = min(20.0, max(5.0, physics_rate * 1.5))
     
     # Apply fixture penalty AFTER clamping
-    return round(clamped * fixture_factor, 1)
+    ramp = round(clamped * fixture_factor, 1)
+    ramp = min(ramp, MAX_RAMP_RATE_C_PER_MIN)  # Final global safety clamp
+    return ramp
 
 def compute_diffusion_time(material: Dict[str, float], thickness_mm: float) -> float:
     """
@@ -527,7 +569,7 @@ def compute_radiation_time(material: Dict[str, float], thickness_mm: float, soak
     """
     rho = material.get("density", 2700.0)  # kg/m³
     cp = material.get("specific_heat", 896.0)  # J/(kg·K)
-    emissivity = material.get("emissivity", 0.8)  # Typical for oxidized aluminum
+    emissivity = material.get("emissivity", 0.85)  # Furnace-dominated effective emissivity
     
     # Stefan-Boltzmann constant
     sigma = 5.67e-8  # W/(m²·K⁴)
@@ -544,38 +586,6 @@ def compute_radiation_time(material: Dict[str, float], thickness_mm: float, soak
     return tau_rad
 
 
-def compute_oxide_delay(soak_temp: float) -> float:
-    """
-    Compute oxide breakdown delay time.
-    
-    From Critical Factors: Oxide requires ≥400°C and sustained time.
-    Uses simplified Arrhenius-type model.
-    
-    At lower temperatures (530°C): longer oxide delay
-    At higher temperatures (560°C): shorter oxide delay
-    
-    Args:
-        soak_temp: Soak temperature in °C
-    
-    Returns:
-        Oxide delay time in seconds
-    """
-    if soak_temp < 400:
-        # Below 400°C, oxide breakdown doesn't occur
-        return 999999  # Effectively infinite
-    
-    # Calibrated oxide breakdown model
-    # Base delay at 400°C is ~30 minutes (1800 seconds)
-    # Decreases by ~10 seconds per °C above 400°C
-    # At 530°C: 1800 - (130 * 10) = 500 seconds (~8 min)
-    # At 560°C: 1800 - (160 * 10) = 200 seconds (~3 min)
-    base_delay = 1800.0  # seconds at 400°C
-    temp_coefficient = 10.0  # seconds per °C
-    
-    oxide_delay = max(0, base_delay - (soak_temp - 400.0) * temp_coefficient)
-    
-    return oxide_delay
-
 
 def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: float = 500.0, job_temp: float = None) -> int:
     """
@@ -584,10 +594,9 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
     Replaces artificial multipliers with explicit physics modeling:
     1. Thermal diffusion time (heat penetration to core)
     2. Radiation heating lag (vacuum furnace characteristic)
-    3. Oxide breakdown delay (process requirement)
-    4. Filler flow time (capillary action)
-    
-    Formula: t_dwell = max(t_diff, τ_rad) + t_oxide + t_flow
+    3. Filler flow time (capillary action)
+
+    Formula: t_dwell = max(t_diff, τ_rad) + t_flow
     
     This model:
     ✓ Scales with thickness
@@ -602,7 +611,7 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
             - characteristic_thickness: in meters
             - avg_thermal_diffusivity: in m²/s
             - part_details: list of part property dicts
-        stage: Stage number (1-6)
+        stage: Stage number (1-5 process stages)
         soak_temp: Soak temperature in °C (default 500°C)
         job_temp: Worst-case job temperature in °C (default None → uses soak_temp)
     
@@ -622,8 +631,8 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
                 material = {
                     'thermal_conductivity': part.get('thermal_conductivity', 167.0),
                     'density': part.get('density', 2700.0),
-                    'specific_heat': params.get('total_heat_capacity', 896.0) / part.get('mass', 1.0) if part.get('mass', 0) > 0 else 896.0,
-                    'emissivity': 0.8  # Typical for oxidized aluminum
+                    'specific_heat': part.get('specific_heat', 896.0),
+                    'emissivity': params.get('effective_emissivity', 0.85)
                 }
                 break
         
@@ -633,7 +642,7 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
                 'thermal_conductivity': 167.0,
                 'density': 2700.0,
                 'specific_heat': 896.0,
-                'emissivity': 0.8
+                'emissivity': params.get('effective_emissivity', 0.85)
             }
     else:
         # Default aluminum 6061-T6 properties
@@ -641,28 +650,16 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
             'thermal_conductivity': 167.0,
             'density': 2700.0,
             'specific_heat': 896.0,
-            'emissivity': 0.8
+            'emissivity': params.get('effective_emissivity', 0.85)
         }
     
     # ========== STEP 1: Compute Thermal Diffusion Time ==========
     t_diff = compute_diffusion_time(material, thickness_mm)
-    
-    # Problem #8 Fix: Biot Number correction
-    # If Bi > 0.1, internal temperature gradients are significant.
-    # We increase the diffusion time to ensure core reach.
-    biot_number = params.get('biot_number', 0.0)
-    if biot_number > 0.1:
-        biot_correction = 1.0 + (biot_number * 0.5) # Up to 15-20% boost
-        t_diff *= min(1.3, biot_correction)
-        logger.debug(f"  Biot Number ({biot_number:.3f}) > 0.1: Diffusion time boosted by factor {min(1.3, biot_correction):.2f}")
-    
+
     # ========== STEP 2: Compute Radiation Time Constant ==========
     t_rad = compute_radiation_time(material, thickness_mm, soak_temp)
-    
-    # ========== STEP 3: Compute Oxide Breakdown Delay ==========
-    t_oxide = compute_oxide_delay(soak_temp)
-    
-    # ========== STEP 4: Add Filler Flow Time ==========
+
+    # ========== STEP 3: Add Filler Flow Time ==========
     # Filler flow time depends on margin above liquidus
     # Larger margin → faster capillary flow → less time needed
     filler_liquidus = params.get('filler_liquidus', 582.0)
@@ -678,22 +675,21 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
     # ========== STEP 5: Combine All Components ==========
     # The governing time is the maximum of diffusion and radiation times
     # (whichever is slower controls the process)
-    # Plus the sequential process delays (oxide + flow)
+    # Plus filler flow time
     t_physics_minimum = max(t_diff, t_rad)  # Hard physics floor
-    t_dwell_seconds = t_physics_minimum + t_oxide + t_flow
+    t_dwell_seconds = t_physics_minimum + t_flow
     
     # Convert to minutes
     t_dwell_minutes = t_dwell_seconds / 60.0
     
     # Log the breakdown for transparency
-    logger.info(f"  Dwell time calculation for Stage {stage}:")
-    logger.info(f"    Setpoint: {soak_temp:.1f}°C, Job temp: {effective_temp:.1f}°C")
-    logger.info(f"    Diffusion time: {t_diff/60:.1f} min")
-    logger.info(f"    Radiation time: {t_rad/60:.1f} min")
-    logger.info(f"    Physics floor: {t_physics_minimum/60:.1f} min")
-    logger.info(f"    Oxide delay: {t_oxide/60:.1f} min")
-    logger.info(f"    Filler flow: {t_flow/60:.1f} min")
-    logger.info(f"    Total dwell: {t_dwell_minutes:.1f} min")
+    logger.debug(f"  Dwell time calculation for Stage {stage}:")
+    logger.debug(f"    Setpoint: {soak_temp:.1f}°C, Job temp: {effective_temp:.1f}°C")
+    logger.debug(f"    Diffusion time: {t_diff/60:.1f} min")
+    logger.debug(f"    Radiation time: {t_rad/60:.1f} min")
+    logger.debug(f"    Physics floor: {t_physics_minimum/60:.1f} min")
+    logger.debug(f"    Filler flow: {t_flow/60:.1f} min")
+    logger.debug(f"    Total dwell: {t_dwell_minutes:.1f} min")
     
     # Safety bounds
     # Minimum: 5 minutes (safety)
@@ -768,19 +764,30 @@ def apply_operational_ramp_limits(temp: float, ramp: float) -> float:
     if clamped_ramp < ramp:
         logger.info(f"  Operational limit applied: {ramp:.1f}°C/min → {clamped_ramp:.1f}°C/min (zone limit: {max_ramp}°C/min at {temp}°C)")
     
+    clamped_ramp = min(clamped_ramp, MAX_RAMP_RATE_C_PER_MIN)  # Final global safety clamp
     return clamped_ramp
 
 
 
-def estimate_job_temperatures(master_temp: float, ramp_rate: float, heat_capacity: float, vacuum_value: float) -> Tuple[float, float]:
+def estimate_job_temperatures(
+    master_temp: float,
+    ramp_rate: float,
+    total_mass_kg: float,
+    vacuum_value: float,
+    vacuum_mode: str = "partial_pressure",
+    fixture_mass_ratio: float = 0.0,
+) -> Tuple[float, float]:
     """
     AI-based estimation of Job-1 & Job-2 temperature lag.
-    RENAMED: heat_capacity (J/K) for clarity (was thermal_mass).
+    Uses total mass (kg) as load proxy to avoid Cp double-counting.
     """
     
     # Normalize factors
-    # Thermal Mass penalty: heavier parts lag more
-    mass_penalty = 1.0 + (heat_capacity / 50000.0)
+    # Keep mass penalty neutral to avoid double-counting load effects already modeled
+    # by fixture lag, radiation coupling, and carbon-sheet penalties.
+    mass_penalty = 1.0
+    # Optional fixture shielding penalty for heavy fixtures.
+    fixture_penalty = 1.0 + min(0.25, max(0.0, fixture_mass_ratio) * 0.5)
     
     # CALCULATE EFFECTIVE RAMP RATE
     # "Digital Twin" correction: The user's furnace and load configuration rarely exceeds 3.5-4.0°C/min linearly.
@@ -789,30 +796,27 @@ def estimate_job_temperatures(master_temp: float, ramp_rate: float, heat_capacit
     max_physical_rate = 4.0 
     effective_rate = min(ramp_rate, max_physical_rate)
     
-    # Vacuum penalty:
-    # 1e-4 is "neutral". 1e-1 is "bad" IF we are comparing to High Vacuum.
-    # But if the furnace IS a partial pressure furnace (14 mbar ~ 1e1), then 14mbar is "Normal".
-    # The Calibration (C=6.0e9) comes from the furnace's NORMAL operation (likely 14mbar).
-    # So we should NOT penalize 14mbar.
-    # We only penalize if it's WORSE than 14mbar (e.g. Atmosphere).
-    # 14 mbar ~ 10 Torr.
-    vac_log = math.log10(max(vacuum_value, 1e-6))
+    # Vacuum penalty uses configured calibration constants.
     vac_penalty = 1.0
-    # Only penalize if PROBABLY worse than standard partial pressure (> 20 mbar)
-    # 20 mbar -> log 1.3
-    if vacuum_value > 20.0:
-        vac_penalty = 1.0 + (math.log10(vacuum_value) - 1.3) * 0.5
+    baseline_mbar = VACUUM_CALIBRATION["baseline_mbar"]
+    # Vacuum regime-aware penalty model:
+    # - partial_pressure: 14 mbar baseline, penalize only if much worse.
+    # - high_vacuum: 1e-4 mbar baseline, penalize degradation above this level.
+    if vacuum_mode == "high_vacuum":
+        if vacuum_value > 1.0e-4:
+            vac_penalty = 1.0 + max(0.0, math.log10(vacuum_value / 1.0e-4)) * 0.20
+    elif vacuum_value > (baseline_mbar * 1.43):
+        vac_penalty = 1.0 + (math.log10(vacuum_value) - math.log10(baseline_mbar * 1.43)) * 0.5
         
-    # PHYSICS-BASED LAG MODEL (Calibrated to User CSV)
-    # C=6.0e9 is robust for Rate=3.2 -> Lag=75-90.
+    # PHYSICS-BASED LAG MODEL (calibrated)
     T_kelvin = master_temp + 273.15
-    C = 6.0e9
+    C = VACUUM_CALIBRATION["lag_constant"]
     
     # Base lag calculated from PHYSICAL rate
     base_lag = (C * effective_rate) / (T_kelvin ** 3)
     
     # Apply penalties
-    total_lag = base_lag * vac_penalty 
+    total_lag = base_lag * vac_penalty * mass_penalty * fixture_penalty
     
     # Job 1 (Best View Factor) sees ~90% of theoretical lag
     job1_lag = total_lag * 0.90
@@ -830,17 +834,6 @@ def estimate_job_temperatures(master_temp: float, ramp_rate: float, heat_capacit
     T_job2 = max(25.0, master_temp - job2_lag)
     
     return round(T_job1, 1), round(T_job2, 1)
-
-
-# ========== LEGACY CALCULATIONS REMOVED (dynamic_hold, calculate_adaptive_hold_time, _ramp_rate_clamped) ==========
-
-    # convert to °C/min if raw is in °C/s
-    if GET_RAMP_RATE_RETURNS_C_PER_S:
-        rate_per_min = float(raw_rate) * 60.0
-    else:
-        rate_per_min = float(raw_rate)
-    # clamp to machine limits
-    return clamp_ramp(rate_per_min)
 
 
 # ========== THERMO-TWIN LOGIC: PROCESS GATING (~400°C) ==========
@@ -869,6 +862,7 @@ QUALIFICATION_THRESHOLDS = {
     "delta_t_uniformity_min": 30.0,       # Minutes where |Job1-Job2| <= 5C
     "oxide_integrity_max": 0.05,          # <= 0.05 means >= 95% disrupted
     "thermal_dose_min": 2000.0,           # Degree-minutes (integral of T_job - 400) [°C·min]
+                                        # Empirical for 6061-T6 + AL718, ~15-25 mm thickness.
 }
 
 def compute_process_verdict(state, filler_liquidus, T_job2_worst):
@@ -1010,10 +1004,12 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     SAF = context['SAF']
     HPR = context['HPR']
     vacuum_value = context['vacuum']['chamber_pressure_mbar']
+    vacuum_mode = context['vacuum'].get('mode', determine_vacuum_mode(vacuum_value))
     
     # Extract geometry/mass info from context (added by calculate_physics_parameters)
     total_mass_kg = context.get('total_mass', 0.0)
     fixture_mass_kg = context.get('fixture_mass', 0.0)
+    fixture_mass_ratio = fixture_mass_kg / total_mass_kg if total_mass_kg > 0 else 0.0
     # Convert m2 to mm2
     total_surface_area_mm2 = context.get('effective_surface_area', 0.0) * 1e6
     max_part_height_mm = context.get('max_dimension', 0.0)
@@ -1049,8 +1045,10 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
             T_job1, T_job2 = estimate_job_temperatures(
                 target_temp, 
                 ramp_rate,
-                effective_heat_capacity, 
-                vacuum_value
+                total_mass_kg,
+                vacuum_value,
+                vacuum_mode,
+                fixture_mass_ratio,
             )
             
             # Physics-based smoothing: Jobs don't jump instantly.
@@ -1142,11 +1140,6 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     has_fixture = fixture_mass_kg > 0
     if has_fixture:
         logger.info("✓ Fixture (SS316L) detected - applying slower ramps & longer soaks")
-        # SS316L k=16 vs Al k=167: fixture absorbs heat 10x slower
-        # 50% ramp penalty ensures assembly heats uniformly
-        fixture_factor = 1.5  # 50% slower due to low conductivity (was 1.3)
-    else:
-        fixture_factor = 1.0
     
     # ========== STEP 4: Calculate Target Temperature ==========
     # NEW: Stricter safety margin (8°C instead of 10°C)
@@ -1204,7 +1197,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     logger.info("="*60)
     
     
-    # ========== STEP 5B: Generate 6-Stage Cycle with Dynamic Holds ==========
+    # ========== STEP 5B: Generate 5 PROCESS heating stages with dynamic holds ==========
     stages = []
     
     # Calculate Fourier-based equilibration time
@@ -1217,9 +1210,9 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     # We use base_solidus as the reference for preheating/stress relief
     T_ref = base_solidus
     
-    # ========== STAGE 1: Oxide Disruption & Initial Heating ==========
-    # User Request: First stage MUST go to ~400°C to disrupt oxide layer.
-    # Logic: Target 400°C (or slightly higher to be safe) to initiate oxide reduction.
+    # ========== STAGE 1: Initial Heating / Activation ==========
+    # Stage-1 is an activation gate only. Oxide disruption is expected later
+    # at higher job temperatures (primarily Stage-4/Stage-5), not at ~400°C.
     
     oxide_integrity = 1.0
     
@@ -1231,9 +1224,10 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     # Ramp rate logic - Locked Ramp Strategy (< 400°C)
     # Ambient -> 400°C: 7-8 °C/min allowed
     # Physics-based ramp rate calculation
-    stage1_ramp = get_physics_ramp_rate(physics_params, 1, base_solidus)
+    stage1_ramp_physics = get_physics_ramp_rate(physics_params, 1, base_solidus)
     # Apply operational zone limits (furnace safety constraint)
-    stage1_ramp = apply_operational_ramp_limits(stage1_temp, stage1_ramp)
+    stage1_ramp = apply_operational_ramp_limits(stage1_temp, stage1_ramp_physics)
+    stage1_ramp_source = "OperationalLimit" if stage1_ramp < stage1_ramp_physics else "Physics"
     logger.info(f"Stage 1 ramp rate (physics-based + operational limits): {stage1_ramp}°C/min")
     
     # Apply Stage 1 Overrides if provided
@@ -1245,17 +1239,21 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         stage1_ramp = clamp_ramp(float(initial_ramp))
         # Re-apply operational limits even for overrides
         stage1_ramp = apply_operational_ramp_limits(stage1_temp, stage1_ramp)
+        stage1_ramp_source = "OperationalLimit" if stage1_ramp < clamp_ramp(float(initial_ramp)) else "Override"
         logger.info(f"Stage 1 Ramp overridden to {stage1_ramp}°C/min")
     
     T_job1_s1, T_job2_s1 = estimate_job_temperatures(
         stage1_temp,
         stage1_ramp,
-        context.get('effective_heat_capacity', 5000.0),
-        context['vacuum']['chamber_pressure_mbar']
+        total_mass_kg,
+        context['vacuum']['chamber_pressure_mbar'],
+        vacuum_mode,
+        fixture_mass_ratio,
     )
     
-    # --- Physics-Based Hold Time ---
-    stage1_hold = get_physics_dwell_time(physics_params, 1, stage1_temp)
+    # --- Stage-1 Hold Time ---
+    # Activation hold is process-defined (not diffusion/radiation/filler-flow driven).
+    stage1_hold = 30
     
     # ========== THERMO-TWIN LOGIC: PROCESS GATING (~400°C) ==========
     # Rule 1: Aluminum thermally "doesn't exist" below ~400°C due to weak radiation & oxide barrier.
@@ -1300,6 +1298,14 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         # Problem #4: Use job_temp (worst-case) instead of avg for conservative physics.
         if job_temp > 500.0:
              decay_rate = 0.05 * (1.0 + (job_temp - 500.0)/50.0) # 5% per minute base
+             if vacuum_mode == "high_vacuum":
+                 # Faster oxide disruption under high vacuum relative to partial-pressure baseline.
+                 vacuum_decay_factor = 1.0 + max(0.0, math.log10(max(14.0 / max(vacuum_value, 1e-6), 1.0))) * 0.10
+             else:
+                 vacuum_decay_factor = 1.0
+             decay_rate *= vacuum_decay_factor
+             # Calibration cap: avoid unrealistically fast oxide clearing at high temperatures.
+             decay_rate = min(decay_rate, 0.10)
              
              # Only decay if integrity is good > 5% (Prevent meaningless decay)
              if state.oxide_integrity > 0.05:
@@ -1307,7 +1313,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
                 decay_factor = math.exp(-decay_rate * time_min)
                 state.oxide_integrity *= decay_factor
                 
-                # Clamp (Problem #3): Prevent falling below 5% saturation
+                # Numerical floor: 0.05 is treated as "fully disrupted" for this model.
                 if state.oxide_integrity < 0.05:
                     state.oxide_integrity = 0.05
         
@@ -1349,8 +1355,9 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         "Stage": "Stage 1",
         "Temperature": stage1_temp,
         "RampRate": round(stage1_ramp, 1),
+        "RampSource": stage1_ramp_source,
         "HoldTime": stage1_hold,
-        "Purpose": f"Initial Heating (Job@{T_job2_s1:.0f}°C, Oxide: {(1-tt_state.oxide_integrity)*100:.0f}% disrupted)",
+        "Purpose": f"Initial Heating (Job@{T_job2_s1:.0f}°C, Oxide intact – activation only)",
         "Job1Temp": T_job1_s1,
         "Job2Temp": T_job2_s1,
         "exit_condition": {
@@ -1368,16 +1375,19 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     stage2_temp = clamp_temp(max(base_s2_temp, stage1_temp + 5))
     
     # Physics-based ramp rate calculation
-    stage2_ramp = get_physics_ramp_rate(physics_params, 2, base_solidus)
+    stage2_ramp_physics = get_physics_ramp_rate(physics_params, 2, base_solidus)
     # Apply operational zone limits (furnace safety constraint)
-    stage2_ramp = apply_operational_ramp_limits(stage2_temp, stage2_ramp)
+    stage2_ramp = apply_operational_ramp_limits(stage2_temp, stage2_ramp_physics)
+    stage2_ramp_source = "OperationalLimit" if stage2_ramp < stage2_ramp_physics else "Physics"
     logger.info(f"Stage 2 ramp rate (physics-based + operational limits): {stage2_ramp}°C/min")
     
     T_job1_s2, T_job2_s2 = estimate_job_temperatures(
         stage2_temp,
         stage2_ramp,
-        effective_heat_capacity,
-        context['vacuum']['chamber_pressure_mbar']
+        total_mass_kg,
+        context['vacuum']['chamber_pressure_mbar'],
+        vacuum_mode,
+        fixture_mass_ratio,
     )
     
     # --- Physics-Based Hold Time (with JOB temperature) ---
@@ -1392,6 +1402,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         "Stage": "Stage 2",
         "Temperature": stage2_temp,
         "RampRate": round(stage2_ramp, 1),
+        "RampSource": stage2_ramp_source,
         "HoldTime": stage2_hold,
         "Purpose": f"Stress Relief (Job@{T_job2_s2:.0f}°C, Eff.Time: {tt_state.effective_thermal_time:.0f}m)",
         "Job1Temp": T_job1_s2,
@@ -1407,16 +1418,19 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     # Dynamic: Filler Liquidus - 50°C
     stage3_temp = clamp_temp(int(filler_liquidus - 50))
     # Physics-based ramp rate calculation
-    stage3_ramp = get_physics_ramp_rate(physics_params, 3, base_solidus)
+    stage3_ramp_physics = get_physics_ramp_rate(physics_params, 3, base_solidus)
     # Apply operational zone limits (furnace safety constraint)
-    stage3_ramp = apply_operational_ramp_limits(stage3_temp, stage3_ramp)
+    stage3_ramp = apply_operational_ramp_limits(stage3_temp, stage3_ramp_physics)
+    stage3_ramp_source = "OperationalLimit" if stage3_ramp < stage3_ramp_physics else "Physics"
     logger.info(f"Stage 3 ramp rate (physics-based + operational limits): {stage3_ramp}°C/min")
     
     T_job1_s3, T_job2_s3 = estimate_job_temperatures(
         stage3_temp,
         stage3_ramp,
-        effective_heat_capacity,
-        context['vacuum']['chamber_pressure_mbar']
+        total_mass_kg,
+        context['vacuum']['chamber_pressure_mbar'],
+        vacuum_mode,
+        fixture_mass_ratio,
     )
     
     # --- Physics-Based Hold Time (with JOB temperature) ---
@@ -1431,6 +1445,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         "Stage": "Stage 3",
         "Temperature": stage3_temp,
         "RampRate": round(stage3_ramp, 1),
+        "RampSource": stage3_ramp_source,
         "HoldTime": stage3_hold,
         "Purpose": f"Thermal Equalization (Job@{T_job2_s3:.0f}°C, ΔT_uniform: {tt_state.delta_t_uniformity_time:.0f}m)",
         "Job1Temp": T_job1_s3,
@@ -1447,16 +1462,19 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     stage4_temp = clamp_temp(int(filler_liquidus - 20))
     # Ramp rate logic - Locked Ramp Strategy (> 500°C)
     # Physics-based ramp rate calculation
-    stage4_ramp = get_physics_ramp_rate(physics_params, 4, base_solidus)
+    stage4_ramp_physics = get_physics_ramp_rate(physics_params, 4, base_solidus)
     # Apply operational zone limits (furnace safety constraint)
-    stage4_ramp = apply_operational_ramp_limits(stage4_temp, stage4_ramp)
+    stage4_ramp = apply_operational_ramp_limits(stage4_temp, stage4_ramp_physics)
+    stage4_ramp_source = "OperationalLimit" if stage4_ramp < stage4_ramp_physics else "Physics"
     logger.info(f"Stage 4 ramp rate (physics-based + operational limits): {stage4_ramp}°C/min") 
     
     T_job1_s4, T_job2_s4 = estimate_job_temperatures(
         stage4_temp,
         stage4_ramp,
-        effective_heat_capacity,
-        context['vacuum']['chamber_pressure_mbar']
+        total_mass_kg,
+        context['vacuum']['chamber_pressure_mbar'],
+        vacuum_mode,
+        fixture_mass_ratio,
     )
     
     # --- Physics-Based Hold Time (with JOB temperature) ---
@@ -1471,6 +1489,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         "Stage": "Stage 4",
         "Temperature": stage4_temp,
         "RampRate": round(stage4_ramp, 1),
+        "RampSource": stage4_ramp_source,
         "HoldTime": stage4_hold,
         "Purpose": f"Brazing Approach (Job@{T_job2_s4:.0f}°C, Dose: {tt_state.thermal_dose:.0f})",
         "Job1Temp": T_job1_s4,
@@ -1483,9 +1502,9 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     })
     
     # ========== STAGE 5: Final Brazing Soak (MELT-READY GATEKEEPER) ==========
-    # CRITICAL CONSTRAINT: Stage-5 hold time is FIXED at 10-15 min
-    # This means Stage-5 is PURE MELTING TIME, not catch-up time
-    # ALL thermal work must be completed in Stage-3 and Stage-4
+    # CRITICAL CONSTRAINT: Stage-5 hold time is NOMINALLY fixed by process class.
+    # Auto-extension is a controlled recovery path when verdict=EXTEND.
+    # Preferred thermal preparation remains Stage-3 and Stage-4.
     
     logger.info("="*60)
     logger.info("STAGE 5: MELT-READY GATEKEEPER ANALYSIS")
@@ -1537,19 +1556,26 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         logger.info(f"  Class 1: Using nominal ({stage5_temp}°C) for light fixtures")
     
     # Fixed ramp rate for Stage-5 (always 1°C/min)
-    stage5_ramp = 1.0
+    stage5_ramp_physics = 1.0
     # Apply operational zone limits (should not change since 1.0 < 2.0 limit)
-    stage5_ramp = apply_operational_ramp_limits(stage5_temp, stage5_ramp)
+    stage5_ramp = apply_operational_ramp_limits(stage5_temp, stage5_ramp_physics)
+    stage5_ramp_source = "OperationalLimit" if stage5_ramp < stage5_ramp_physics else "Physics"
     logger.info(f"Stage 5 ramp rate: {stage5_ramp}°C/min (FIXED + operational limits)")
     
     # Calculate job temperatures for Stage 5
     T_job1_s5, T_job2_s5 = estimate_job_temperatures(
         stage5_temp,
         stage5_ramp,
-        effective_heat_capacity,
-        context['vacuum']['chamber_pressure_mbar']
+        total_mass_kg,
+        context['vacuum']['chamber_pressure_mbar'],
+        vacuum_mode,
+        fixture_mass_ratio,
     )
     
+    # Stage-5 feasibility gate (before Stage-5 qualification/extension logic)
+    if T_job2_s5 < filler_liquidus + 5:
+        logger.warning(f"FEASIBILITY CHECK FAILED (pre-Stage-5): Job Temp ({T_job2_s5:.1f}°C) < Required Flow Temp ({filler_liquidus+5:.1f}°C)")
+
     # ========== MELT-READY ENTRY CONDITIONS (MANDATORY) ==========
     # Stage-5 can ONLY succeed if these conditions are met BEFORE entry
     
@@ -1588,9 +1614,9 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     logger.info(f"  Required: ≥{melt_ready_temp:.1f}°C (Liquidus - 5°C)")
     logger.info(f"  Status: {'✓ PASS' if temp_ready_ok else '✗ FAIL - Temperature too low'}")
     
-    # Condition 4: Oxide Integrity (Oxide must be sufficiently disrupted)
-    # Threshold: oxide_integrity must be < 0.3 (70% disrupted)
-    # This ensures the oxide barrier has been broken down enough for brazing
+    # Condition 4: Oxide Integrity (entry gate, not final acceptance)
+    # Entry gate allows Stage-5 when disruption is sufficient to initiate flow.
+    # Final qualification remains stricter in QUALIFICATION_THRESHOLDS (≤0.05).
     oxide_threshold = 0.3
     oxide_ready_ok = tt_state.oxide_integrity < oxide_threshold
     oxide_disruption_percent = (1.0 - tt_state.oxide_integrity) * 100
@@ -1662,7 +1688,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     logger.info(f"Melt-Ready Status: {'✓ READY' if melt_ready else '✗ NOT READY'}")
     logger.info(f"Final Thermo-Twin Stats (JOB-TEMP GATED):")
     logger.info(f"  Effective Time (job>400°C): {tt_state.effective_thermal_time:.1f} min")
-    logger.info(f"  Thermal Dose (job-gated): {tt_state.thermal_dose:.1e} units")
+    logger.info(f"  Thermal Dose (job-gated): {tt_state.thermal_dose:.0f} °C·min")
     logger.info(f"  Effective Brazing Time (job≥liquidus): {tt_state.effective_brazing_time:.1f} min")
     logger.info(f"  Filler Flow Time (job≥liq+5): {tt_state.filler_flow_time:.1f} min")
     logger.info(f"  ΔT Uniformity Time (|J1-J2|≤5°C): {tt_state.delta_t_uniformity_time:.1f} min")
@@ -1696,7 +1722,15 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     logger.info(f"  REASON:  {verdict_details['reason']}")
     logger.info(f"  PASSED:  {verdict_details['passed_count']}/{verdict_details['total_count']} checks")
     logger.info("="*60)
-    
+
+    # Hard feasibility fail before extension logic.
+    if process_verdict == "EXTEND" and T_job2_s5 < filler_liquidus + 5:
+        process_verdict = "FAIL"
+        verdict_details["verdict"] = "FAIL"
+        verdict_details["reason"] = f"Job physics limit reached ({T_job2_s5:.1f}°C). Part shielding or furnace power insufficient for filler flow."
+        tt_state.process_verdict = "FAIL"
+        tt_state.verdict_details = verdict_details
+
     # ========== AUTOMATIC STAGE EXTENSION ==========
     # If verdict is EXTEND, the cycle can be saved by holding longer.
     # Logic: Bounded loop (max 3 retries) with safety caps.
@@ -1704,17 +1738,6 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     MAX_EXTENSIONS = 3
     MAX_TOTAL_STAGE5_TIME = 90.0  # Production safety limit (min)
     
-    # Problem 5: FEASIBILITY GATE (Hard rule - Problem #5 Fix)
-    # If Job-2 temperature at Stage 5 is fundamentally below Liquidus + 5, 
-    # we cannot fulfill capillary flow. Extend logic won't help if physics is at steady state.
-    if process_verdict == "EXTEND" and T_job2_s5 < filler_liquidus + 5:
-        logger.warning(f"FEASIBILITY CHECK FAILED: Job Temp ({T_job2_s5:.1f}°C) < Required Flow Temp ({filler_liquidus+5}°C)")
-        process_verdict = "FAIL"
-        verdict_details["verdict"] = "FAIL"
-        verdict_details["reason"] = f"Job physics limit reached ({T_job2_s5:.1f}°C). Part shielding or furnace power insufficient for filler flow."
-        tt_state.process_verdict = "FAIL"
-        tt_state.verdict_details = verdict_details
-
     ext_count = 0
     while process_verdict == "EXTEND" and ext_count < MAX_EXTENSIONS:
         logger.info("="*60)
@@ -1792,20 +1815,26 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
             # Apply extension
             stage5_hold += extension_to_apply
             
-            # Simulate Physics for Extension Period
-            # CRITICAL FIX: Use positional or correct keyword args
-            # Function signature: (setpoint_c, job1_temp, job2_temp, time_min, state, filler_liq)
-            simulate_thermo_twin_accumulation(
-                stage5_temp, T_job1_s5, T_job2_s5, 
-                extension_to_apply, # Positional 4th arg (time_min)
-                tt_state, 
-                filler_liquidus
-            )
-            # Note: simulate_thermo_twin_accumulation signature needs adjustment? 
-            # Or pass positional? "extension_applied" keyword might be wrong if signature is (setpoint, job1, job2, time, state, liq)
-            # Looking at signature L1395: (setpoint_c, job1_temp, job2_temp, time_min, state, filler_liq)
-            # So I should pass as positional or correct keyword 'time_min'.
-            # Correcting below...
+            # Simulate extension period conservatively.
+            # Credit is only applied when steady-state Job-2 is at/above liquidus.
+            extension_job_temp = min(T_job1_s5, T_job2_s5)
+            if extension_job_temp >= filler_liquidus:
+                simulate_thermo_twin_accumulation(
+                    stage5_temp, T_job1_s5, T_job2_s5,
+                    extension_to_apply,
+                    tt_state,
+                    filler_liquidus
+                )
+            else:
+                logger.warning(
+                    f"  Extension credit blocked: Job temp {extension_job_temp:.1f}°C < liquidus {filler_liquidus:.1f}°C"
+                )
+                process_verdict = "FAIL"
+                verdict_details["verdict"] = "FAIL"
+                verdict_details["reason"] = "Stage-5 extension attempted below liquidus (no brazing credit)."
+                tt_state.process_verdict = "FAIL"
+                tt_state.verdict_details = verdict_details
+                break
             
             # Update loop counter
             ext_count += 1
@@ -1847,6 +1876,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         "Stage": "Stage 5",
         "Temperature": stage5_temp,
         "RampRate": round(stage5_ramp, 1),
+        "RampSource": stage5_ramp_source,
         "HoldTime": stage5_hold,
         "Purpose": stage5_purpose,
         "Job1Temp": T_job1_s5,
@@ -1858,7 +1888,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         "FillerFlowTime": round(tt_state.filler_flow_time, 1),
         "OxideDisruption": round((1-tt_state.oxide_integrity)*100, 1),
         "DeltaTUniformityTime": round(tt_state.delta_t_uniformity_time, 1),
-        "ThermalDose": f"{round(tt_state.thermal_dose, 0)} °C·min", # Problem #3 Unit standardized
+        "ThermalDose": round(tt_state.thermal_dose, 0),  # numeric °C·min value (format at UI layer)
         "FinalQualification": {
             "verdict": process_verdict,
             "reason": verdict_details["reason"],
@@ -1884,6 +1914,7 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         s['ProcessClass'] = process_class
         s['SoakBand'] = class_band
         s['ClassColor'] = class_color
+        s['ProcessStage'] = True
     
     logger.debug(f"5-STAGE CYCLE GENERATED:")
     for stage in stages:
@@ -2021,7 +2052,7 @@ def generate_backfill_stage(vacuum_settings: Dict[str, Any]) -> Dict[str, Any]:
     """
     # if vacuum_settings.get("use_n2_backfill", False):
     #     return {
-    #         "Stage": "Stage 8",
+    #         "Stage": "Cooling",
     #         "Temperature": 50,  # Target cooling temperature
     #         "Pressure": f"{vacuum_settings['backfill_pressure']} mbar",
     #         "RampRate": 0,  # Will be set by physics
@@ -2030,7 +2061,7 @@ def generate_backfill_stage(vacuum_settings: Dict[str, Any]) -> Dict[str, Any]:
     #     }
     # else:
     #     return {
-    #         "Stage": "Stage 8",
+    #         "Stage": "Cooling",
     #         "Temperature": 50,  # Target cooling temperature
     #         "Pressure": f"{vacuum_settings['pump_down_target']:.1e} mbar",
     #         "RampRate": 0,  # Will be set by physics
@@ -2041,6 +2072,7 @@ def generate_backfill_stage(vacuum_settings: Dict[str, Any]) -> Dict[str, Any]:
 def generate_brazing_cycle(simulation_state, initial_temp=None, initial_ramp=None, overrides=None):
     """
     Main function to generate the complete brazing cycle including vacuum stages.
+    Process stages are Stage 1..Stage 5 (heating/soak). Cooling is a non-process stage.
     Returns structured dict with cycle and verdict metadata.
     """
     # 1. Extract context (includes vacuum settings)
@@ -2067,10 +2099,11 @@ def generate_brazing_cycle(simulation_state, initial_temp=None, initial_ramp=Non
     # 4. Combine all stages
     full_cycle = vacuum_stages + heat_stages
     
-    # 5. Add Final Cooling Stage (Problem #9)
-    # Ensure termination always includes cooling
+    # 5. Add Final Cooling Stage (non-process stage)
+    # Cooling is intentionally NOT numbered as a process stage.
     cooling_stage = {
         "Stage": "Cooling",
+        "ProcessStage": False,
         "Temperature": 50,
         "RampRate": 0, # Max cooling
         "HoldTime": 0,
@@ -2093,4 +2126,3 @@ def generate_brazing_cycle(simulation_state, initial_temp=None, initial_ramp=Non
         "final_verdict": final_verdict,
         "verdict_details": verdict_details
     }
-
