@@ -586,38 +586,6 @@ def compute_radiation_time(material: Dict[str, float], thickness_mm: float, soak
     return tau_rad
 
 
-def compute_oxide_delay(soak_temp: float) -> float:
-    """
-    Compute oxide breakdown delay time.
-    
-    From Critical Factors: Oxide requires ≥400°C and sustained time.
-    Uses simplified Arrhenius-type model.
-    
-    At lower temperatures (530°C): longer oxide delay
-    At higher temperatures (560°C): shorter oxide delay
-    
-    Args:
-        soak_temp: Soak temperature in °C
-    
-    Returns:
-        Oxide delay time in seconds
-    """
-    if soak_temp < 400:
-        # Below 400°C, oxide breakdown doesn't occur
-        return 999999  # Effectively infinite
-    
-    # Calibrated oxide breakdown model
-    # Base delay at 400°C is ~30 minutes (1800 seconds)
-    # Decreases by ~10 seconds per °C above 400°C
-    # At 530°C: 1800 - (130 * 10) = 500 seconds (~8 min)
-    # At 560°C: 1800 - (160 * 10) = 200 seconds (~3 min)
-    base_delay = 1800.0  # seconds at 400°C
-    temp_coefficient = 10.0  # seconds per °C
-    
-    oxide_delay = max(0, base_delay - (soak_temp - 400.0) * temp_coefficient)
-    
-    return oxide_delay
-
 
 def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: float = 500.0, job_temp: float = None) -> int:
     """
@@ -626,10 +594,9 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
     Replaces artificial multipliers with explicit physics modeling:
     1. Thermal diffusion time (heat penetration to core)
     2. Radiation heating lag (vacuum furnace characteristic)
-    3. Oxide breakdown delay (process requirement)
-    4. Filler flow time (capillary action)
-    
-    Formula: t_dwell = max(t_diff, τ_rad) + t_oxide + t_flow
+    3. Filler flow time (capillary action)
+
+    Formula: t_dwell = max(t_diff, τ_rad) + t_flow
     
     This model:
     ✓ Scales with thickness
@@ -644,7 +611,7 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
             - characteristic_thickness: in meters
             - avg_thermal_diffusivity: in m²/s
             - part_details: list of part property dicts
-        stage: Stage number (1-6)
+        stage: Stage number (1-5 process stages)
         soak_temp: Soak temperature in °C (default 500°C)
         job_temp: Worst-case job temperature in °C (default None → uses soak_temp)
     
@@ -688,23 +655,11 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
     
     # ========== STEP 1: Compute Thermal Diffusion Time ==========
     t_diff = compute_diffusion_time(material, thickness_mm)
-    
-    # Problem #8 Fix: Biot Number correction
-    # If Bi > 0.1, internal temperature gradients are significant.
-    # We increase the diffusion time to ensure core reach.
-    biot_number = params.get('biot_number', 0.0)
-    if biot_number > 0.1:
-        biot_correction = 1.0 + (biot_number * 0.5) # Up to 15-20% boost
-        t_diff *= min(1.3, biot_correction)
-        logger.debug(f"  Biot Number ({biot_number:.3f}) > 0.1: Diffusion time boosted by factor {min(1.3, biot_correction):.2f}")
-    
+
     # ========== STEP 2: Compute Radiation Time Constant ==========
     t_rad = compute_radiation_time(material, thickness_mm, soak_temp)
-    
-    # ========== STEP 3: Compute Oxide Breakdown Delay ==========
-    t_oxide = compute_oxide_delay(soak_temp)
-    
-    # ========== STEP 4: Add Filler Flow Time ==========
+
+    # ========== STEP 3: Add Filler Flow Time ==========
     # Filler flow time depends on margin above liquidus
     # Larger margin → faster capillary flow → less time needed
     filler_liquidus = params.get('filler_liquidus', 582.0)
@@ -720,9 +675,9 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
     # ========== STEP 5: Combine All Components ==========
     # The governing time is the maximum of diffusion and radiation times
     # (whichever is slower controls the process)
-    # Plus the sequential process delays (oxide + flow)
+    # Plus filler flow time
     t_physics_minimum = max(t_diff, t_rad)  # Hard physics floor
-    t_dwell_seconds = t_physics_minimum + t_oxide + t_flow
+    t_dwell_seconds = t_physics_minimum + t_flow
     
     # Convert to minutes
     t_dwell_minutes = t_dwell_seconds / 60.0
@@ -733,7 +688,6 @@ def get_physics_dwell_time(params: Dict[str, float], stage: int, soak_temp: floa
     logger.debug(f"    Diffusion time: {t_diff/60:.1f} min")
     logger.debug(f"    Radiation time: {t_rad/60:.1f} min")
     logger.debug(f"    Physics floor: {t_physics_minimum/60:.1f} min")
-    logger.debug(f"    Oxide delay: {t_oxide/60:.1f} min")
     logger.debug(f"    Filler flow: {t_flow/60:.1f} min")
     logger.debug(f"    Total dwell: {t_dwell_minutes:.1f} min")
     
@@ -908,6 +862,7 @@ QUALIFICATION_THRESHOLDS = {
     "delta_t_uniformity_min": 30.0,       # Minutes where |Job1-Job2| <= 5C
     "oxide_integrity_max": 0.05,          # <= 0.05 means >= 95% disrupted
     "thermal_dose_min": 2000.0,           # Degree-minutes (integral of T_job - 400) [°C·min]
+                                        # Empirical for 6061-T6 + AL718, ~15-25 mm thickness.
 }
 
 def compute_process_verdict(state, filler_liquidus, T_job2_worst):
@@ -1185,13 +1140,6 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     has_fixture = fixture_mass_kg > 0
     if has_fixture:
         logger.info("✓ Fixture (SS316L) detected - applying slower ramps & longer soaks")
-        # Calibration note:
-        # Fixture influence is intentionally represented in multiple terms
-        # (ramp, lag, and dwell) to match empirical furnace behavior.
-        # SS316L k=16 vs Al k=167: fixture absorbs heat 10x slower.
-        fixture_factor = 1.5  # 50% slower due to low conductivity (calibrated)
-    else:
-        fixture_factor = 1.0
     
     # ========== STEP 4: Calculate Target Temperature ==========
     # NEW: Stricter safety margin (8°C instead of 10°C)
@@ -1303,8 +1251,9 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         fixture_mass_ratio,
     )
     
-    # --- Physics-Based Hold Time ---
-    stage1_hold = get_physics_dwell_time(physics_params, 1, stage1_temp)
+    # --- Stage-1 Hold Time ---
+    # Activation hold is process-defined (not diffusion/radiation/filler-flow driven).
+    stage1_hold = 30
     
     # ========== THERMO-TWIN LOGIC: PROCESS GATING (~400°C) ==========
     # Rule 1: Aluminum thermally "doesn't exist" below ~400°C due to weak radiation & oxide barrier.
@@ -1349,6 +1298,12 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         # Problem #4: Use job_temp (worst-case) instead of avg for conservative physics.
         if job_temp > 500.0:
              decay_rate = 0.05 * (1.0 + (job_temp - 500.0)/50.0) # 5% per minute base
+             if vacuum_mode == "high_vacuum":
+                 # Faster oxide disruption under high vacuum relative to partial-pressure baseline.
+                 vacuum_decay_factor = 1.0 + max(0.0, math.log10(max(14.0 / max(vacuum_value, 1e-6), 1.0))) * 0.10
+             else:
+                 vacuum_decay_factor = 1.0
+             decay_rate *= vacuum_decay_factor
              
              # Only decay if integrity is good > 5% (Prevent meaningless decay)
              if state.oxide_integrity > 0.05:
@@ -1615,6 +1570,10 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
         fixture_mass_ratio,
     )
     
+    # Stage-5 feasibility gate (before Stage-5 qualification/extension logic)
+    if T_job2_s5 < filler_liquidus + 5:
+        logger.warning(f"FEASIBILITY CHECK FAILED (pre-Stage-5): Job Temp ({T_job2_s5:.1f}°C) < Required Flow Temp ({filler_liquidus+5:.1f}°C)")
+
     # ========== MELT-READY ENTRY CONDITIONS (MANDATORY) ==========
     # Stage-5 can ONLY succeed if these conditions are met BEFORE entry
     
@@ -1761,7 +1720,15 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     logger.info(f"  REASON:  {verdict_details['reason']}")
     logger.info(f"  PASSED:  {verdict_details['passed_count']}/{verdict_details['total_count']} checks")
     logger.info("="*60)
-    
+
+    # Hard feasibility fail before extension logic.
+    if process_verdict == "EXTEND" and T_job2_s5 < filler_liquidus + 5:
+        process_verdict = "FAIL"
+        verdict_details["verdict"] = "FAIL"
+        verdict_details["reason"] = f"Job physics limit reached ({T_job2_s5:.1f}°C). Part shielding or furnace power insufficient for filler flow."
+        tt_state.process_verdict = "FAIL"
+        tt_state.verdict_details = verdict_details
+
     # ========== AUTOMATIC STAGE EXTENSION ==========
     # If verdict is EXTEND, the cycle can be saved by holding longer.
     # Logic: Bounded loop (max 3 retries) with safety caps.
@@ -1769,17 +1736,6 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
     MAX_EXTENSIONS = 3
     MAX_TOTAL_STAGE5_TIME = 90.0  # Production safety limit (min)
     
-    # Problem 5: FEASIBILITY GATE (Hard rule - Problem #5 Fix)
-    # If Job-2 temperature at Stage 5 is fundamentally below Liquidus + 5, 
-    # we cannot fulfill capillary flow. Extend logic won't help if physics is at steady state.
-    if process_verdict == "EXTEND" and T_job2_s5 < filler_liquidus + 5:
-        logger.warning(f"FEASIBILITY CHECK FAILED: Job Temp ({T_job2_s5:.1f}°C) < Required Flow Temp ({filler_liquidus+5}°C)")
-        process_verdict = "FAIL"
-        verdict_details["verdict"] = "FAIL"
-        verdict_details["reason"] = f"Job physics limit reached ({T_job2_s5:.1f}°C). Part shielding or furnace power insufficient for filler flow."
-        tt_state.process_verdict = "FAIL"
-        tt_state.verdict_details = verdict_details
-
     ext_count = 0
     while process_verdict == "EXTEND" and ext_count < MAX_EXTENSIONS:
         logger.info("="*60)
@@ -2094,7 +2050,7 @@ def generate_backfill_stage(vacuum_settings: Dict[str, Any]) -> Dict[str, Any]:
     """
     # if vacuum_settings.get("use_n2_backfill", False):
     #     return {
-    #         "Stage": "Stage 8",
+    #         "Stage": "Cooling",
     #         "Temperature": 50,  # Target cooling temperature
     #         "Pressure": f"{vacuum_settings['backfill_pressure']} mbar",
     #         "RampRate": 0,  # Will be set by physics
@@ -2103,7 +2059,7 @@ def generate_backfill_stage(vacuum_settings: Dict[str, Any]) -> Dict[str, Any]:
     #     }
     # else:
     #     return {
-    #         "Stage": "Stage 8",
+    #         "Stage": "Cooling",
     #         "Temperature": 50,  # Target cooling temperature
     #         "Pressure": f"{vacuum_settings['pump_down_target']:.1e} mbar",
     #         "RampRate": 0,  # Will be set by physics
@@ -2114,6 +2070,7 @@ def generate_backfill_stage(vacuum_settings: Dict[str, Any]) -> Dict[str, Any]:
 def generate_brazing_cycle(simulation_state, initial_temp=None, initial_ramp=None, overrides=None):
     """
     Main function to generate the complete brazing cycle including vacuum stages.
+    Process stages are Stage 1..Stage 5 (heating/soak). Cooling is a non-process stage.
     Returns structured dict with cycle and verdict metadata.
     """
     # 1. Extract context (includes vacuum settings)
