@@ -1304,6 +1304,8 @@ def generate_physics_based_cycle(context, initial_temp=None, initial_ramp=None, 
              else:
                  vacuum_decay_factor = 1.0
              decay_rate *= vacuum_decay_factor
+             # Calibration cap: avoid unrealistically fast oxide clearing at high temperatures.
+             decay_rate = min(decay_rate, 0.10)
              
              # Only decay if integrity is good > 5% (Prevent meaningless decay)
              if state.oxide_integrity > 0.05:
