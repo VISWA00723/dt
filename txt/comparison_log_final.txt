@@ -1,0 +1,16 @@
+
+=== TESTING SCENARIO: HEAVY_PART (Thickness: 15.0mm) ===
+Stage      | Temp     | Hold Time (min)
+----------------------------------------
+Stage 1    | 288      | 132            
+Stage 2    | 384      | 120            
+Stage 5    | 562      | 50             
+Stage 6    | 592      | 18             
+
+=== TESTING SCENARIO: LIGHT_PART (Thickness: 7.5mm) ===
+Stage      | Temp     | Hold Time (min)
+----------------------------------------
+Stage 1    | 288      | 75             
+Stage 2    | 384      | 67             
+Stage 5    | 562      | 28             
+Stage 6    | 592      | 10             

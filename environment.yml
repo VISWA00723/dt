@@ -1,0 +1,39 @@
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+
+
+  # Core scientific packages
+  - numpy>=1.21.0
+  - scipy>=1.7.0
+  - pandas>=1.3.0
+
+  # ⚠️  CRITICAL: FEniCS packages (must be installed via conda)
+  - fenics-dolfin>=2019.1.0
+  # Removed mshr - using gmsh for better mesh generation instead
+
+  # 3D processing and visualization
+  - trimesh>=3.9.0
+  - pyvista>=0.33.0
+  - vtk>=9.0.0
+
+  # Mesh processing (better alternative to mshr)
+  - meshio>=5.0.0
+  - gmsh>=4.8.0
+
+  # Web framework and other packages (installed via pip)
+  - pip
+  - pip:
+    # Packages not available via conda or better via pip
+    - fastapi>=0.103.1
+    - uvicorn[standard]>=0.23.2
+    - python-multipart>=0.0.6
+    - pyiges[full]>=0.3.1
+    - geomdl>=1.0.0
+    - websockets>=10.0
+    - python-socketio>=5.0.0
+    - python-engineio>=4.0.0
+    - python-jose[cryptography]>=3.3.0
+    - passlib[bcrypt]>=1.7.0
+    - python-dotenv>=0.19.0
